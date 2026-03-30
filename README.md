@@ -9,10 +9,10 @@ It uses:
 
 ## Project Structure
 
-- `scriptnew.py` → main training + evaluation + prediction script
-- `dataset/` → speaker-wise folders (each folder = one person)
-- `Input_dataset/` / `Voices/` → sample audio files
-- `run.bat`, `run.ps1` → helper run scripts
+- `scriptnew.py` - main training + evaluation + prediction script
+- `dataset/` - speaker-wise folders (each folder = one person)
+- `Input_dataset/` / `Voices/` - sample audio files
+- `run.bat`, `run.ps1` - helper run scripts
 
 ## How It Works (Short)
 
@@ -36,4 +36,4 @@ Use your virtual environment, then run:
 - For some formats like `.aac`, FFmpeg may be needed.
 
 ---
-This repo is for learning and experimentation, so the code is intentionally straightforward and beginner-friendly.
+

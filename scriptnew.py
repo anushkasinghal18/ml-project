@@ -1,16 +1,20 @@
 import os
 import sys
 import shutil
+import csv
+from datetime import datetime
 from collections import Counter
 
 import librosa
 import numpy as np
-import sounddevice as sd
+import pandas as pd
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
+from sklearn.neighbors import KNeighborsClassifier
 from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.tree import DecisionTreeClassifier
 from sklearn.svm import SVC
-from scipy.io.wavfile import write as write_wav
 
 
 
@@ -37,6 +41,11 @@ check_venv()
 # Configuration
 # -----------------------------
 DATASET_DIR = "dataset"
+OUTPUT_DIR = "outputs"
+MFCC_EXCEL_FILE = "mfcc_features.xlsx"
+EVAL_EXCEL_FILE = "evaluation_metrics.xlsx"
+COMPARISON_EXCEL_FILE = "model_comparison.xlsx"
+MANUAL_EVAL_CSV_FILE = "manual_prediction_accuracy.csv"
 SUPPORTED_EXTENSIONS = (".wav", ".ogg", ".flac", ".aac", ".mp3", ".m4a")
 SAMPLE_RATE = 16000
 N_MFCC = 13
@@ -105,6 +114,7 @@ def load_dataset(dataset_dir=DATASET_DIR):
 	"""
 	features = []
 	labels = []
+	feature_records = []
 	skipped_files = 0
 
 	if not os.path.isdir(dataset_dir):
@@ -123,9 +133,6 @@ def load_dataset(dataset_dir=DATASET_DIR):
 
 	if not speaker_folders:
 		raise ValueError("No speaker folders found inside dataset directory.")
-
-	print("\n=== Step 1: Data Preprocessing ===")
-	print(f"Dataset path: {dataset_dir}")
 
 	for speaker in speaker_folders:
 		speaker_dir = os.path.join(dataset_dir, speaker)
@@ -147,7 +154,15 @@ def load_dataset(dataset_dir=DATASET_DIR):
 
 			features.append(feature_vector)
 			labels.append(speaker)
-			print(f"Loaded: {file_path} -> label='{speaker}'")
+
+			record = {
+				"speaker": speaker,
+				"file_name": audio_file,
+				"file_path": file_path,
+			}
+			for idx, value in enumerate(feature_vector, start=1):
+				record[f"mfcc_feature_{idx}"] = float(value)
+			feature_records.append(record)
 
 	if not features:
 		raise ValueError(
@@ -158,14 +173,7 @@ def load_dataset(dataset_dir=DATASET_DIR):
 	X = np.array(features, dtype=np.float32)
 	y = np.array(labels)
 
-	print("\n=== Step 2: Feature Handling ===")
-	print(f"MFCC count per frame: {N_MFCC}")
-	print(f"Feature vector size per audio: {X.shape[1]} (mean+std)")
-
-	print("\n=== Step 3: Dataset Creation ===")
-	print(f"X shape: {X.shape}")
-	print(f"y shape: {y.shape}")
-	print("Samples per class:", dict(Counter(y)))
+	print(f"Loaded dataset: {len(y)} samples, {len(np.unique(y))} speakers")
 	if skipped_files:
 		print(f"Skipped unreadable files: {skipped_files}")
 
@@ -174,7 +182,29 @@ def load_dataset(dataset_dir=DATASET_DIR):
 			"Need at least 2 speaker classes with readable audio to train a classifier."
 		)
 
-	return X, y
+	return X, y, feature_records
+
+
+def save_mfcc_features_to_excel(feature_records, output_path):
+	"""
+	Per-audio MFCC feature vectors ko Excel me save karta hai.
+	"""
+	if not feature_records:
+		print("[WARN] No MFCC feature records found to save.")
+		return
+
+	os.makedirs(os.path.dirname(output_path), exist_ok=True)
+	df = pd.DataFrame(feature_records)
+	try:
+		df.to_excel(output_path, index=False)
+		print(f"MFCC feature Excel generated: {output_path}")
+	except PermissionError:
+		base, ext = os.path.splitext(output_path)
+		timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+		fallback_path = f"{base}_{timestamp}{ext}"
+		df.to_excel(fallback_path, index=False)
+		print(f"[WARN] File locked: {output_path}")
+		print(f"MFCC feature Excel generated at fallback path: {fallback_path}")
 
 
 # Test size decide karta hai ki total data me se kitna hissa testing ke liye jayega.
@@ -191,27 +221,55 @@ def choose_test_size(y_labels):
 		return 0.5
 	return 0.2
 
-# Ab model train karke uski performance evaluate karte hain.
-def train_and_evaluate_svm(X, y, kernel="linear"):
+def evaluate_model_predictions(y_test, y_pred, label_encoder, model_name):
 	"""
-	Step 4 + Step 5 + Step 6:
+	Given predictions, standard evaluation metrics compute karta hai aur print bhi karta hai.
+	"""
+	acc = accuracy_score(y_test, y_pred)
+	cm = confusion_matrix(y_test, y_pred)
+
+	classification_text = classification_report(
+		y_test,
+		y_pred,
+		target_names=label_encoder.classes_,
+		zero_division=0,
+	)
+
+	report_dict = classification_report(
+		y_test,
+		y_pred,
+		target_names=label_encoder.classes_,
+		zero_division=0,
+		output_dict=True,
+	)
+
+	print(f"\n--- {model_name} Evaluation ---")
+	print(f"Accuracy: {acc * 100:.2f}%")
+	print("Confusion Matrix (rows=true, cols=predicted):")
+	print(cm)
+	print("\nClassification Report:")
+	print(classification_text)
+
+	return {
+		"accuracy": acc,
+		"confusion_matrix": cm,
+		"classification_report_text": classification_text,
+		"classification_report_dict": report_dict,
+	}
+
+
+# Ab models train karke unki performance evaluate karte hain.
+def prepare_train_test_data(X, y):
+	"""
+	Step 4 helper:
 	- Encode labels
 	- Stratified split
 	- Scale features
-	- Train SVM
-	- Evaluate with accuracy + confusion matrix
 	"""
-	print("\n=== Step 4: Train-Test Split ===")
-
 	label_encoder = LabelEncoder()
 	y_encoded = label_encoder.fit_transform(y)
 
-	print("Label mapping (number -> speaker):")
-	for idx, class_name in enumerate(label_encoder.classes_):
-		print(f"  {idx} -> {class_name}")
-
 	test_size = choose_test_size(y)
-	print(f"Using stratified split with test_size={test_size}")
 
 	X_train, X_test, y_train, y_test = train_test_split(
 		X,
@@ -225,48 +283,244 @@ def train_and_evaluate_svm(X, y, kernel="linear"):
 	X_train_scaled = scaler.fit_transform(X_train)
 	X_test_scaled = scaler.transform(X_test)
 
-	print(f"Training samples: {len(X_train_scaled)}")
-	print(f"Testing samples: {len(X_test_scaled)}")
+	return {
+		"label_encoder": label_encoder,
+		"scaler": scaler,
+		"X_train_raw": X_train,
+		"X_test_raw": X_test,
+		"X_train_scaled": X_train_scaled,
+		"X_test_scaled": X_test_scaled,
+		"y_train": y_train,
+		"y_test": y_test,
+	}
 
-	print("\n=== Step 5: Model Training ===")
-	print("Kernel explanation:")
-	print("- linear: simpler boundary, good first baseline for tiny datasets")
-	print("- rbf: nonlinear boundary, often powerful but needs more data/tuning")
 
+def train_and_evaluate_svm(prepared_data, kernel="linear"):
+	"""
+	Step 5 + Step 6 (SVM):
+	SVM ko train karke metrics return karta hai.
+	"""
 	model = SVC(kernel=kernel, C=1.0, gamma="scale")
-	model.fit(X_train_scaled, y_train)
-	print(f"SVM trained successfully with kernel='{kernel}'")
-
-	print("\n=== Step 6: Evaluation ===")
-	y_pred = model.predict(X_test_scaled)
-
-	acc = accuracy_score(y_test, y_pred)
-	print(f"Accuracy: {acc * 100:.2f}%")
-
-	cm = confusion_matrix(y_test, y_pred)
-	print("\nConfusion Matrix (rows=true, cols=predicted):")
-	print(cm)
-
-	print("\nClassification Report:")
-	print(
-		classification_report(
-			y_test,
-			y_pred,
-			target_names=label_encoder.classes_,
-			zero_division=0,
-		)
+	model.fit(prepared_data["X_train_scaled"], prepared_data["y_train"])
+	y_pred = model.predict(prepared_data["X_test_scaled"])
+	metrics = evaluate_model_predictions(
+		prepared_data["y_test"],
+		y_pred,
+		prepared_data["label_encoder"],
+		"SVM",
 	)
 
-	print("How to read confusion matrix:")
-	print("- Diagonal numbers = correct predictions")
-	print("- Off-diagonal numbers = mistakes (speaker confusion)")
+	return {
+		"model": model,
+		"metrics": metrics,
+	}
+
+
+def train_and_evaluate_knn(prepared_data, n_neighbors=3):
+	"""
+	Step 5 + Step 6 (KNN):
+	KNN ko train karke metrics return karta hai.
+	"""
+	model = KNeighborsClassifier(n_neighbors=n_neighbors)
+	model.fit(prepared_data["X_train_scaled"], prepared_data["y_train"])
+	y_pred = model.predict(prepared_data["X_test_scaled"])
+	metrics = evaluate_model_predictions(
+		prepared_data["y_test"],
+		y_pred,
+		prepared_data["label_encoder"],
+		"KNN",
+	)
+
+	return {
+		"model": model,
+		"metrics": metrics,
+	}
+
+
+def train_and_evaluate_decision_tree(prepared_data, max_depth=None):
+	"""
+	Step 5 + Step 6 (Decision Tree):
+	Decision Tree ko train karke metrics return karta hai.
+	"""
+	model = DecisionTreeClassifier(max_depth=max_depth, random_state=RANDOM_STATE)
+	model.fit(prepared_data["X_train_raw"], prepared_data["y_train"])
+	y_pred = model.predict(prepared_data["X_test_raw"])
+	metrics = evaluate_model_predictions(
+		prepared_data["y_test"],
+		y_pred,
+		prepared_data["label_encoder"],
+		"Decision Tree",
+	)
+
+	return {
+		"model": model,
+		"metrics": metrics,
+	}
+
+
+def train_and_evaluate_logistic_regression(prepared_data, max_iter=1000):
+	"""
+	Step 5 + Step 6 (Logistic Regression):
+	Logistic Regression ko train karke metrics return karta hai.
+	"""
+	model = LogisticRegression(max_iter=max_iter, random_state=RANDOM_STATE)
+	model.fit(prepared_data["X_train_scaled"], prepared_data["y_train"])
+	y_pred = model.predict(prepared_data["X_test_scaled"])
+	metrics = evaluate_model_predictions(
+		prepared_data["y_test"],
+		y_pred,
+		prepared_data["label_encoder"],
+		"Logistic Regression",
+	)
+
+	return {
+		"model": model,
+		"metrics": metrics,
+	}
+
+
+def train_and_evaluate_models(X, y, svm_kernel="linear", knn_neighbors=3):
+	"""
+	Orchestrator:
+	- Shared data prep
+	- Separate SVM, KNN, Decision Tree and Logistic Regression functions
+	- Comparison rows build
+	"""
+	prepared_data = prepare_train_test_data(X, y)
+
+	svm_result = train_and_evaluate_svm(prepared_data, kernel=svm_kernel)
+	knn_result = train_and_evaluate_knn(prepared_data, n_neighbors=knn_neighbors)
+	dt_result = train_and_evaluate_decision_tree(prepared_data, max_depth=None)
+	lr_result = train_and_evaluate_logistic_regression(prepared_data, max_iter=1000)
+	svm_metrics = svm_result["metrics"]
+	knn_metrics = knn_result["metrics"]
+	dt_metrics = dt_result["metrics"]
+	lr_metrics = lr_result["metrics"]
+
+	comparison_rows = [
+		{
+			"model": "SVM",
+			"accuracy": float(svm_metrics["accuracy"]),
+			"accuracy_percent": float(svm_metrics["accuracy"]) * 100.0,
+			"macro_f1": float(svm_metrics["classification_report_dict"]["macro avg"]["f1-score"]),
+			"weighted_f1": float(svm_metrics["classification_report_dict"]["weighted avg"]["f1-score"]),
+		},
+		{
+			"model": "KNN",
+			"accuracy": float(knn_metrics["accuracy"]),
+			"accuracy_percent": float(knn_metrics["accuracy"]) * 100.0,
+			"macro_f1": float(knn_metrics["classification_report_dict"]["macro avg"]["f1-score"]),
+			"weighted_f1": float(knn_metrics["classification_report_dict"]["weighted avg"]["f1-score"]),
+		},
+		{
+			"model": "Decision Tree",
+			"accuracy": float(dt_metrics["accuracy"]),
+			"accuracy_percent": float(dt_metrics["accuracy"]) * 100.0,
+			"macro_f1": float(dt_metrics["classification_report_dict"]["macro avg"]["f1-score"]),
+			"weighted_f1": float(dt_metrics["classification_report_dict"]["weighted avg"]["f1-score"]),
+		},
+		{
+			"model": "Logistic Regression",
+			"accuracy": float(lr_metrics["accuracy"]),
+			"accuracy_percent": float(lr_metrics["accuracy"]) * 100.0,
+			"macro_f1": float(lr_metrics["classification_report_dict"]["macro avg"]["f1-score"]),
+			"weighted_f1": float(lr_metrics["classification_report_dict"]["weighted avg"]["f1-score"]),
+		},
+	]
 
 	artifacts = {
-		"model": model,
-		"scaler": scaler,
-		"label_encoder": label_encoder,
+		"model": svm_result["model"],
+		"scaler": prepared_data["scaler"],
+		"label_encoder": prepared_data["label_encoder"],
+		"primary_model_name": "SVM",
+		"primary_model_params": {
+			"svm_kernel": svm_kernel,
+			"knn_neighbors": knn_neighbors,
+		},
+		"adaptive_X": prepared_data["X_train_raw"].copy(),
+		"adaptive_y": prepared_data["y_train"].copy(),
+		"metrics": svm_metrics,
+		"all_metrics": {
+			"SVM": svm_metrics,
+			"KNN": knn_metrics,
+			"Decision Tree": dt_metrics,
+			"Logistic Regression": lr_metrics,
+		},
+		"all_models": {
+			"SVM": svm_result["model"],
+			"KNN": knn_result["model"],
+			"Decision Tree": dt_result["model"],
+			"Logistic Regression": lr_result["model"],
+		},
+		"comparison_rows": comparison_rows,
 	}
 	return artifacts
+
+
+def save_model_comparison_to_excel(comparison_rows, output_path):
+	"""
+	SVM vs KNN ka summary comparison Excel me save karta hai.
+	"""
+	if not comparison_rows:
+		print("[WARN] No comparison rows found to save.")
+		return
+
+	os.makedirs(os.path.dirname(output_path), exist_ok=True)
+	comparison_df = pd.DataFrame(comparison_rows)
+	try:
+		comparison_df.to_excel(output_path, sheet_name="comparison", index=False)
+		print(f"Model comparison Excel generated: {output_path}")
+	except PermissionError:
+		base, ext = os.path.splitext(output_path)
+		timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+		fallback_path = f"{base}_{timestamp}{ext}"
+		comparison_df.to_excel(fallback_path, sheet_name="comparison", index=False)
+		print(f"[WARN] File locked: {output_path}")
+		print(f"Model comparison Excel generated at fallback path: {fallback_path}")
+
+
+def save_evaluation_to_excel(metrics, label_encoder, output_path):
+	"""
+	Accuracy, confusion matrix aur classification report ko multi-sheet Excel me save karta hai.
+	"""
+	os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+	accuracy_df = pd.DataFrame(
+		[
+			{
+				"metric": "accuracy",
+				"value": float(metrics["accuracy"]),
+				"value_percent": float(metrics["accuracy"]) * 100.0,
+			}
+		]
+	)
+
+	labels = list(label_encoder.classes_)
+	cm_df = pd.DataFrame(
+		metrics["confusion_matrix"],
+		index=[f"true_{name}" for name in labels],
+		columns=[f"pred_{name}" for name in labels],
+	)
+
+	report_df = pd.DataFrame(metrics["classification_report_dict"]).transpose()
+	report_df.index.name = "class_or_avg"
+
+	try:
+		with pd.ExcelWriter(output_path) as writer:
+			accuracy_df.to_excel(writer, sheet_name="accuracy", index=False)
+			cm_df.to_excel(writer, sheet_name="confusion_matrix")
+			report_df.to_excel(writer, sheet_name="classification_report")
+		print(f"Evaluation Excel generated: {output_path}")
+	except PermissionError:
+		base, ext = os.path.splitext(output_path)
+		timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+		fallback_path = f"{base}_{timestamp}{ext}"
+		with pd.ExcelWriter(fallback_path) as writer:
+			accuracy_df.to_excel(writer, sheet_name="accuracy", index=False)
+			cm_df.to_excel(writer, sheet_name="confusion_matrix")
+			report_df.to_excel(writer, sheet_name="classification_report")
+		print(f"[WARN] File locked: {output_path}")
+		print(f"Evaluation Excel generated at fallback path: {fallback_path}")
 
 
 def predict_speaker(audio_path, model, scaler, label_encoder):
@@ -284,27 +538,96 @@ def predict_speaker(audio_path, model, scaler, label_encoder):
 	return pred_label
 
 
-def record_from_microphone(output_path, duration_seconds=5, sample_rate=SAMPLE_RATE):
+def predict_speaker_with_features(audio_path, model, scaler, label_encoder):
 	"""
-	Mic se audio record karke WAV file save karta hai prediction ke liye.
+	Prediction ke saath raw feature vector bhi return karta hai,
+	taaki feedback se model update kiya ja sake.
 	"""
-	if duration_seconds <= 0:
-		raise ValueError("Recording duration must be greater than 0 seconds.")
+	feature_vector = extract_mfcc_features(audio_path)
+	if feature_vector is None:
+		raise ValueError(f"Could not extract features from: {audio_path}")
 
-	print(f"\nRecording starts now... Speak for {duration_seconds} seconds.")
-	audio = sd.rec(
-		int(duration_seconds * sample_rate),
-		samplerate=sample_rate,
-		channels=1,
-		dtype="float32",
-	)
-	sd.wait()
+	feature_vector_2d = feature_vector.reshape(1, -1)
+	feature_vector_scaled = scaler.transform(feature_vector_2d)
+	pred_numeric = model.predict(feature_vector_scaled)[0]
+	pred_label = label_encoder.inverse_transform([pred_numeric])[0]
+	return pred_label, feature_vector
 
-	# WAV save karne ke liye float audio ko int16 format me convert karte hain.
-	audio_int16 = np.int16(np.clip(audio, -1.0, 1.0) * 32767)
-	write_wav(output_path, sample_rate, audio_int16)
-	print(f"Recording saved to: {output_path}")
-	return output_path
+
+def retrain_model_from_feedback(artifacts):
+	"""
+	Adaptive dataset (feedback-added) se model ko re-train karta hai.
+	Isse next prediction updated model se hota hai.
+	"""
+	model_name = artifacts["primary_model_name"]
+	params = artifacts["primary_model_params"]
+
+	new_scaler = StandardScaler()
+	X_scaled = new_scaler.fit_transform(artifacts["adaptive_X"])
+
+	if model_name == "SVM":
+		new_model = SVC(kernel=params["svm_kernel"], C=1.0, gamma="scale")
+	elif model_name == "KNN":
+		new_model = KNeighborsClassifier(n_neighbors=params["knn_neighbors"])
+	else:
+		raise ValueError(f"Unsupported primary_model_name: {model_name}")
+
+	new_model.fit(X_scaled, artifacts["adaptive_y"])
+	artifacts["scaler"] = new_scaler
+	artifacts["model"] = new_model
+
+
+def resolve_user_label(user_input, label_encoder):
+	"""
+	User-entered label ko known class labels se case-insensitive match karta hai.
+	Match na mile to None return karta hai.
+	"""
+	cleaned = user_input.strip()
+	if cleaned == "":
+		return None
+
+	label_map = {label.lower(): label for label in label_encoder.classes_}
+	return label_map.get(cleaned.lower())
+
+
+def save_manual_evaluation_rows(rows, output_path):
+	"""
+	Manual prediction checks ko CSV me append karta hai.
+	"""
+	if not rows:
+		return
+
+	os.makedirs(os.path.dirname(output_path), exist_ok=True)
+	file_exists = os.path.isfile(output_path)
+	fieldnames = [
+		"timestamp",
+		"input_mode",
+		"input_path",
+		"predicted_speaker",
+		"true_speaker",
+		"is_correct",
+		"running_accuracy_percent",
+		"model_updated",
+		"adaptive_training_samples",
+	]
+
+	try:
+		with open(output_path, mode="a", newline="", encoding="utf-8") as csv_file:
+			writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+			if not file_exists:
+				writer.writeheader()
+			writer.writerows(rows)
+		print(f"Saved manual log: {output_path}")
+	except PermissionError:
+		base, ext = os.path.splitext(output_path)
+		timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+		fallback_path = f"{base}_{timestamp}{ext}"
+		with open(fallback_path, mode="w", newline="", encoding="utf-8") as csv_file:
+			writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+			writer.writeheader()
+			writer.writerows(rows)
+		print(f"[WARN] File locked: {output_path}")
+		print(f"Saved manual log (fallback): {fallback_path}")
 
 
 def interactive_prediction(artifacts):
@@ -313,120 +636,139 @@ def interactive_prediction(artifacts):
 	TTY na ho to safely skip kar deta hai.
 	"""
 	if not sys.stdin.isatty():
-		print("\n=== Step 7: Prediction (Interactive) ===")
-		print("Skipping interactive prediction (non-interactive mode detected).")
-		print("To use mic recording or file prediction, run in an interactive terminal:")
+		print("Interactive prediction skipped (non-interactive terminal).")
+		print("Run in an interactive terminal:")
 		print(f"  {os.path.join('.venv', 'Scripts', 'python.exe')} {os.path.basename(__file__)}")
 		return
 
-	print("\n=== Step 7: Prediction (Interactive) ===")
-	print("Choose input mode:")
-	print("1) Predict using an existing audio file")
-	print("2) Record from microphone and predict")
+	print("\nFile prediction mode")
+	print("Known speakers:", ", ".join(artifacts["label_encoder"].classes_))
 
-	try:
-		choice = input("Enter 1 or 2 (or press Enter to skip): ").strip()
-	except (KeyboardInterrupt, EOFError):
-		print("Skipping interactive prediction (no input received).")
-		return
+	manual_correct = 0
+	manual_total = 0
+	manual_rows = []
 
-	if choice == "":
-		print("Skipping interactive prediction.")
-		return
-
-	if choice == "1":
+	while True:
 		try:
-			audio_path = input("Enter full path to audio file (.wav/.ogg/.aac/...): ").strip().strip('"')
+			audio_path = input("\nEnter audio file path (or press Enter/q to quit): ").strip().strip('"')
 		except (KeyboardInterrupt, EOFError):
-			print("Skipping interactive prediction.")
-			return
+			print("\nPrediction stopped.")
+			break
+
+		if audio_path.lower() in {"", "q"}:
+			print("Prediction stopped.")
+			break
 
 		if not os.path.isfile(audio_path):
 			print(f"[ERROR] File not found: {audio_path}")
-			return
+			continue
 
-		predicted = predict_speaker(
+		predicted, sample_features = predict_speaker_with_features(
 			audio_path,
 			artifacts["model"],
 			artifacts["scaler"],
 			artifacts["label_encoder"],
 		)
-		print(f"Predicted speaker: {predicted}")
-		return
+		input_mode = "file"
+		input_path = audio_path
+		print(f"Predicted: {predicted}")
 
-	if choice == "2":
 		try:
-			duration_input = input("Enter recording duration in seconds (default 5): ").strip()
+			true_label_input = input(
+				"Enter TRUE speaker label for this sample (press Enter to skip): "
+			).strip()
 		except (KeyboardInterrupt, EOFError):
-			print("Skipping interactive prediction.")
-			return
+			print("Skipping manual scoring for this sample.")
+			continue
 
-		if duration_input == "":
-			duration_seconds = 5
-		else:
-			try:
-				duration_seconds = int(duration_input)
-			except ValueError:
-				print("[ERROR] Duration must be an integer.")
-				return
+		if true_label_input == "":
+			print("Manual scoring skipped for this sample.")
+			continue
 
-		recorded_file = os.path.join(os.getcwd(), "live_test_recording.wav")
-		try:
-			record_from_microphone(
-				output_path=recorded_file,
-				duration_seconds=duration_seconds,
-				sample_rate=SAMPLE_RATE,
-			)
-		except Exception as exc:
-			print(f"[ERROR] Microphone recording failed: {type(exc).__name__}: {exc}")
-			print("        Check mic permission/device and try again.")
-			return
-
-		predicted = predict_speaker(
-			recorded_file,
-			artifacts["model"],
-			artifacts["scaler"],
+		resolved_true_label = resolve_user_label(
+			true_label_input,
 			artifacts["label_encoder"],
 		)
-		print(f"Predicted speaker for live recording: {predicted}")
-		return
+		if resolved_true_label is None:
+			print("[ERROR] Unknown speaker label.")
+			print("Use one of:", ", ".join(artifacts["label_encoder"].classes_))
+			continue
 
-	print("[ERROR] Invalid choice. Enter only 1 or 2.")
+		is_correct = int(predicted == resolved_true_label)
+		manual_total += 1
+		manual_correct += is_correct
+		running_accuracy = (manual_correct / manual_total) * 100.0
+
+		# Feedback sample ko adaptive training set me add karke model update karte hain.
+		true_numeric = artifacts["label_encoder"].transform([resolved_true_label])[0]
+		artifacts["adaptive_X"] = np.vstack(
+			[artifacts["adaptive_X"], sample_features.reshape(1, -1)]
+		)
+		artifacts["adaptive_y"] = np.append(artifacts["adaptive_y"], true_numeric)
+		retrain_model_from_feedback(artifacts)
+
+		manual_rows.append(
+			{
+				"timestamp": datetime.now().isoformat(timespec="seconds"),
+				"input_mode": input_mode,
+				"input_path": input_path,
+				"predicted_speaker": predicted,
+				"true_speaker": resolved_true_label,
+				"is_correct": is_correct,
+				"running_accuracy_percent": round(running_accuracy, 2),
+				"model_updated": 1,
+				"adaptive_training_samples": int(len(artifacts["adaptive_y"])),
+			}
+		)
+
+		status_text = "Correct ✅" if is_correct else "Wrong ❌"
+		print(
+			f"{status_text} | Accuracy: "
+			f"{manual_correct}/{manual_total} = {running_accuracy:.2f}%"
+		)
+		print("Model updated.")
+
+	if manual_total > 0:
+		manual_csv_path = os.path.join(OUTPUT_DIR, MANUAL_EVAL_CSV_FILE)
+		save_manual_evaluation_rows(manual_rows, manual_csv_path)
+		print(
+			f"Final accuracy: "
+			f"{manual_correct}/{manual_total} = {(manual_correct / manual_total) * 100:.2f}%"
+		)
+	else:
+		print("No labeled predictions entered.")
 
 
 def main():
-	print("Speaker Identification Project (SVM + MFCC)")
-	print("Input: audio file | Output: speaker label")
+	print("Speaker Identification (file input)")
 
-	X, y = load_dataset(DATASET_DIR)
-	artifacts = train_and_evaluate_svm(X, y, kernel="linear")
+	X, y, feature_records = load_dataset(DATASET_DIR)
+
+	mfcc_excel_path = os.path.join(OUTPUT_DIR, MFCC_EXCEL_FILE)
+	save_mfcc_features_to_excel(feature_records, mfcc_excel_path)
+
+	artifacts = train_and_evaluate_models(X, y, svm_kernel="linear", knn_neighbors=3)
+	print(
+		f"Model accuracy (test split) - SVM: {artifacts['all_metrics']['SVM']['accuracy'] * 100:.2f}% | "
+		f"KNN: {artifacts['all_metrics']['KNN']['accuracy'] * 100:.2f}% | "
+		f"Decision Tree: {artifacts['all_metrics']['Decision Tree']['accuracy'] * 100:.2f}% | "
+		f"Logistic Regression: {artifacts['all_metrics']['Logistic Regression']['accuracy'] * 100:.2f}%"
+	)
+
+	eval_excel_path = os.path.join(OUTPUT_DIR, EVAL_EXCEL_FILE)
+	save_evaluation_to_excel(
+		metrics=artifacts["metrics"],
+		label_encoder=artifacts["label_encoder"],
+		output_path=eval_excel_path,
+	)
+
+	comparison_excel_path = os.path.join(OUTPUT_DIR, COMPARISON_EXCEL_FILE)
+	save_model_comparison_to_excel(
+		comparison_rows=artifacts["comparison_rows"],
+		output_path=comparison_excel_path,
+	)
+
 	interactive_prediction(artifacts)
-
-	# Optional example: apni audio file ka path dekar direct predict kar sakte ho.
-	# example_file = r"dataset\\person 1\\sample.wav"
-	# predicted = predict_speaker(
-	#     example_file,
-	#     artifacts["model"],
-	#     artifacts["scaler"],
-	#     artifacts["label_encoder"],
-	# )
-	# print(f"\nPredicted speaker for '{example_file}': {predicted}")
-
-	print("\n=== Notes: Small Dataset Limitations ===")
-	print("- With very few recordings per speaker, model can overfit.")
-	print("- High accuracy on one split may not generalize to new recordings.")
-
-	print("\n=== How to Improve Accuracy ===")
-	print("1) Collect more recordings per speaker (different sessions/times)")
-	print("2) Keep microphone and room noise conditions consistent")
-	print("3) Remove long silence segments from audio")
-	print("4) Try data augmentation (noise, pitch/time shift)")
-	print("5) Tune SVM hyperparameters (C, gamma) and compare kernels")
-
-	print("\n=== Future Improvements ===")
-	print("- Use speaker embeddings (x-vectors, ECAPA-TDNN, wav2vec features)")
-	print("- Try deep learning (CNN/CRNN) on spectrograms")
-	print("- Use transfer learning from pretrained audio models")
 
 
 if __name__ == "__main__":

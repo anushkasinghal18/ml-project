@@ -116,6 +116,7 @@ def load_dataset(dataset_dir=DATASET_DIR):
 	labels = []
 	feature_records = []
 	skipped_files = 0
+	skipped_speakers = []
 
 	if not os.path.isdir(dataset_dir):
 		raise FileNotFoundError(
@@ -144,6 +145,10 @@ def load_dataset(dataset_dir=DATASET_DIR):
 				and f.lower().endswith(SUPPORTED_EXTENSIONS)
 			]
 		)
+
+		if len(audio_files) < 2:
+			skipped_speakers.append((speaker, len(audio_files)))
+			continue
 
 		for audio_file in audio_files:
 			file_path = os.path.join(speaker_dir, audio_file)
@@ -176,6 +181,10 @@ def load_dataset(dataset_dir=DATASET_DIR):
 	print(f"Loaded dataset: {len(y)} samples, {len(np.unique(y))} speakers")
 	if skipped_files:
 		print(f"Skipped unreadable files: {skipped_files}")
+	if skipped_speakers:
+		print("Skipped speakers with <2 files:")
+		for speaker_name, file_count in skipped_speakers:
+			print(f"  - {speaker_name} ({file_count} file{'s' if file_count != 1 else ''})")
 
 	if len(np.unique(y)) < 2:
 		raise ValueError(

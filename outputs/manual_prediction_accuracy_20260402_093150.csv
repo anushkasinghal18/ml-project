@@ -1,4 +1,0 @@
-timestamp,input_mode,input_path,predicted_speaker,true_speaker,is_correct,running_accuracy_percent,model_updated,adaptive_training_samples
-2026-04-02T09:20:42,file,D:\2ndYear\ML\Voice_trial\Input_dataset\input2.ogg,person 6,person 1,0,0.0,1,11
-2026-04-02T09:20:54,file,D:\2ndYear\ML\Voice_trial\Input_dataset\input3.ogg,person 9,person 9,1,50.0,1,12
-2026-04-02T09:21:18,file,D:\2ndYear\ML\Voice_trial\Input_dataset\ankita_3.ogg,person 6,person 8,0,33.33,1,13

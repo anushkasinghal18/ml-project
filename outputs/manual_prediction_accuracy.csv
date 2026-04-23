@@ -1,2 +1,0 @@
-timestamp,input_mode,input_path,predicted_speaker,true_speaker,is_correct,running_accuracy_percent,model_updated,adaptive_training_samples
-2026-04-22T09:58:36,file,D:\2ndYear\ML\Voice_trial\Input_dataset\vardhan_2.ogg,person 18,person 18,1,100.0,1,43

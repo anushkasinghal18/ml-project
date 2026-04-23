@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.tree import DecisionTreeClassifier
@@ -46,9 +46,13 @@ MFCC_EXCEL_FILE = "mfcc_features.xlsx"
 EVAL_EXCEL_FILE = "evaluation_metrics.xlsx"
 COMPARISON_EXCEL_FILE = "model_comparison.xlsx"
 MANUAL_EVAL_CSV_FILE = "manual_prediction_accuracy.csv"
-SUPPORTED_EXTENSIONS = (".wav", ".ogg", ".flac", ".aac", ".mp3", ".m4a")
+SUPPORTED_EXTENSIONS = (".wav", ".ogg", ".flac", ".aac", ".mp3", ".m4a", ".mpeg")
 SAMPLE_RATE = 16000
-N_MFCC = 13
+N_MFCC = 20
+FIXED_AUDIO_DURATION_SEC = 3.0
+MIN_AUDIO_DURATION_SEC = 0.5
+TRIM_TOP_DB = 25
+CONFIDENCE_THRESHOLD = 0.55
 RANDOM_STATE = 42
 
 '''
@@ -66,12 +70,68 @@ def extract_mfcc_features(file_path, sample_rate=SAMPLE_RATE, n_mfcc=N_MFCC):
 		if signal.size == 0:
 			return None
 
+		# Loudness normalize + silence trim for better real-world robustness.
+		signal = librosa.util.normalize(signal)
+		signal, _ = librosa.effects.trim(signal, top_db=TRIM_TOP_DB)
+
+		if signal.size < int(MIN_AUDIO_DURATION_SEC * sample_rate):
+			return None
+
+		# Fixed duration (center crop/pad) makes train and real input distribution closer.
+		target_len = int(FIXED_AUDIO_DURATION_SEC * sample_rate)
+		if signal.size < target_len:
+			pad = target_len - signal.size
+			left = pad // 2
+			right = pad - left
+			signal = np.pad(signal, (left, right), mode="constant")
+		elif signal.size > target_len:
+			start = (signal.size - target_len) // 2
+			signal = signal[start:start + target_len]
+
 		mfcc = librosa.feature.mfcc(y=signal, sr=sr, n_mfcc=n_mfcc)
+		delta_1 = librosa.feature.delta(mfcc, order=1)
+		delta_2 = librosa.feature.delta(mfcc, order=2)
+
+		rms = librosa.feature.rms(y=signal)
+		zcr = librosa.feature.zero_crossing_rate(y=signal)
+		spectral_centroid = librosa.feature.spectral_centroid(y=signal, sr=sr)
+		spectral_bandwidth = librosa.feature.spectral_bandwidth(y=signal, sr=sr)
+		spectral_rolloff = librosa.feature.spectral_rolloff(y=signal, sr=sr)
 
 		mfcc_mean = np.mean(mfcc, axis=1)
 		mfcc_std = np.std(mfcc, axis=1)
+		delta_1_mean = np.mean(delta_1, axis=1)
+		delta_1_std = np.std(delta_1, axis=1)
+		delta_2_mean = np.mean(delta_2, axis=1)
+		delta_2_std = np.std(delta_2, axis=1)
 
-		feature_vector = np.concatenate([mfcc_mean, mfcc_std])
+		energy_features = np.array(
+			[
+				float(np.mean(rms)),
+				float(np.std(rms)),
+				float(np.mean(zcr)),
+				float(np.std(zcr)),
+				float(np.mean(spectral_centroid)),
+				float(np.std(spectral_centroid)),
+				float(np.mean(spectral_bandwidth)),
+				float(np.std(spectral_bandwidth)),
+				float(np.mean(spectral_rolloff)),
+				float(np.std(spectral_rolloff)),
+			],
+			dtype=np.float32,
+		)
+
+		feature_vector = np.concatenate(
+			[
+				mfcc_mean,
+				mfcc_std,
+				delta_1_mean,
+				delta_1_std,
+				delta_2_mean,
+				delta_2_std,
+				energy_features,
+			]
+		)
 		return feature_vector
 
 	except Exception as exc:
@@ -230,6 +290,16 @@ def choose_test_size(y_labels):
 		return 0.5
 	return 0.2
 
+
+def choose_cv_splits(y_labels):
+	"""
+	Cross-validation folds ko safe range me rakhta hai,
+	taki tiny classes me CV fail na ho.
+	"""
+	class_counts = Counter(y_labels)
+	min_per_class = min(class_counts.values())
+	return max(2, min(5, int(min_per_class)))
+
 def evaluate_model_predictions(y_test, y_pred, label_encoder, model_name):
 	"""
 	Given predictions, standard evaluation metrics compute karta hai aur print bhi karta hai.
@@ -309,8 +379,29 @@ def train_and_evaluate_svm(prepared_data, kernel="linear"):
 	Step 5 + Step 6 (SVM):
 	SVM ko train karke metrics return karta hai.
 	"""
-	model = SVC(kernel=kernel, C=1.0, gamma="scale")
-	model.fit(prepared_data["X_train_scaled"], prepared_data["y_train"])
+	y_train = prepared_data["y_train"]
+	cv_splits = choose_cv_splits(y_train)
+	cv = StratifiedKFold(n_splits=cv_splits, shuffle=True, random_state=RANDOM_STATE)
+
+	base_svm = SVC(probability=True, class_weight="balanced", random_state=RANDOM_STATE)
+	param_grid = [
+		{"kernel": [kernel], "C": [0.5, 1.0, 5.0], "gamma": ["scale"]},
+	]
+	if kernel != "linear":
+		param_grid.append({"kernel": [kernel], "C": [1.0, 5.0, 10.0], "gamma": ["scale", 0.01, 0.001]})
+
+	search = GridSearchCV(
+		estimator=base_svm,
+		param_grid=param_grid,
+		scoring="f1_weighted",
+		cv=cv,
+		n_jobs=-1,
+		verbose=0,
+	)
+	search.fit(prepared_data["X_train_scaled"], y_train)
+	model = search.best_estimator_
+	print(f"Best SVM params: {search.best_params_}")
+
 	y_pred = model.predict(prepared_data["X_test_scaled"])
 	metrics = evaluate_model_predictions(
 		prepared_data["y_test"],
@@ -321,6 +412,7 @@ def train_and_evaluate_svm(prepared_data, kernel="linear"):
 
 	return {
 		"model": model,
+		"best_params": search.best_params_,
 		"metrics": metrics,
 	}
 
@@ -443,7 +535,7 @@ def train_and_evaluate_models(X, y, svm_kernel="linear", knn_neighbors=3):
 		"label_encoder": prepared_data["label_encoder"],
 		"primary_model_name": "SVM",
 		"primary_model_params": {
-			"svm_kernel": svm_kernel,
+			"svm_params": svm_result["model"].get_params(),
 			"knn_neighbors": knn_neighbors,
 		},
 		"adaptive_X": prepared_data["X_train_raw"].copy(),
@@ -560,7 +652,14 @@ def predict_speaker_with_features(audio_path, model, scaler, label_encoder):
 	feature_vector_scaled = scaler.transform(feature_vector_2d)
 	pred_numeric = model.predict(feature_vector_scaled)[0]
 	pred_label = label_encoder.inverse_transform([pred_numeric])[0]
-	return pred_label, feature_vector
+
+	all_probs = None
+	confidence = None
+	if hasattr(model, "predict_proba"):
+		all_probs = model.predict_proba(feature_vector_scaled)[0]
+		confidence = float(np.max(all_probs))
+
+	return pred_label, feature_vector, confidence, all_probs
 
 
 def retrain_model_from_feedback(artifacts):
@@ -575,7 +674,9 @@ def retrain_model_from_feedback(artifacts):
 	X_scaled = new_scaler.fit_transform(artifacts["adaptive_X"])
 
 	if model_name == "SVM":
-		new_model = SVC(kernel=params["svm_kernel"], C=1.0, gamma="scale")
+		svm_params = dict(params["svm_params"])
+		svm_params.pop("cache_size", None)
+		new_model = SVC(**svm_params)
 	elif model_name == "KNN":
 		new_model = KNeighborsClassifier(n_neighbors=params["knn_neighbors"])
 	else:
@@ -672,7 +773,7 @@ def interactive_prediction(artifacts):
 			print(f"[ERROR] File not found: {audio_path}")
 			continue
 
-		predicted, sample_features = predict_speaker_with_features(
+		predicted, sample_features, confidence, all_probs = predict_speaker_with_features(
 			audio_path,
 			artifacts["model"],
 			artifacts["scaler"],
@@ -680,7 +781,22 @@ def interactive_prediction(artifacts):
 		)
 		input_mode = "file"
 		input_path = audio_path
-		print(f"Predicted: {predicted}")
+		if confidence is not None:
+			print(f"Predicted: {predicted} (confidence: {confidence * 100:.1f}%)")
+			if confidence < CONFIDENCE_THRESHOLD:
+				print(
+					"[WARN] Low confidence prediction. "
+					"Try cleaner audio, less background noise, and 3-5 sec speech."
+				)
+
+			if all_probs is not None:
+				top_indices = np.argsort(all_probs)[::-1][:3]
+				print("Top-3 candidates:")
+				for idx in top_indices:
+					name = artifacts["label_encoder"].inverse_transform([idx])[0]
+					print(f"  - {name}: {all_probs[idx] * 100:.1f}%")
+		else:
+			print(f"Predicted: {predicted}")
 
 		try:
 			true_label_input = input(
